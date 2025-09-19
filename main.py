@@ -251,45 +251,49 @@ async def flight_plan_monitor():
         await asyncio.sleep(10)  # Wait if no configurations
         return
     
-    # ATC24 WebSocket endpoint - you may need to update this URL
-    websocket_urls = [
-        "wss://24data.ptfs.app/ws",
-        "wss://24data.ptfs.app/websocket", 
-        "wss://24data.ptfs.app/api/ws",
-        "wss://24data.ptfs.app/live"
-    ]
+    # ATC24 WebSocket endpoint
+    ws_url = "wss://24data.ptfs.app/wss"
     
-    for ws_url in websocket_urls:
-        try:
-            logger.info(f"Attempting to connect to WebSocket: {ws_url}")
-            async with websockets.connect(ws_url, ping_interval=30, ping_timeout=10) as websocket:
-                logger.info(f"Successfully connected to ATC24 WebSocket: {ws_url}")
-                bot.websocket_connection = websocket
-                
-                async for message in websocket:
-                    try:
-                        data = json.loads(message)
-                        await process_flight_plan(data)
-                    except json.JSONDecodeError:
-                        logger.warning(f"Received invalid JSON from WebSocket: {message[:100]}...")
-                    except Exception as e:
-                        logger.error(f"Error processing WebSocket message: {e}")
-                        
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning(f"WebSocket connection closed: {ws_url}")
-            await asyncio.sleep(5)  # Wait before reconnecting
-            break
-        except websockets.exceptions.InvalidURI:
-            logger.warning(f"Invalid WebSocket URI: {ws_url}")
-            continue  # Try next URL
-        except Exception as e:
-            logger.error(f"WebSocket connection error for {ws_url}: {e}")
-            await asyncio.sleep(5)
-            continue  # Try next URL
+    try:
+        logger.info(f"Attempting to connect to WebSocket: {ws_url}")
+        async with websockets.connect(ws_url, ping_interval=30, ping_timeout=10) as websocket:
+            logger.info(f"Successfully connected to ATC24 WebSocket: {ws_url}")
+            bot.websocket_connection = websocket
+            
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    await process_websocket_message(data)
+                except json.JSONDecodeError:
+                    logger.warning(f"Received invalid JSON from WebSocket: {message[:100]}...")
+                except Exception as e:
+                    logger.error(f"Error processing WebSocket message: {e}")
+                    
+    except websockets.exceptions.ConnectionClosed:
+        logger.warning(f"WebSocket connection closed: {ws_url}")
+        await asyncio.sleep(5)  # Wait before reconnecting
+    except websockets.exceptions.InvalidURI:
+        logger.warning(f"Invalid WebSocket URI: {ws_url}")
+        await asyncio.sleep(30)
+    except Exception as e:
+        logger.error(f"WebSocket connection error for {ws_url}: {e}")
+        await asyncio.sleep(5)
+
+async def process_websocket_message(message_data):
+    """Process WebSocket message from 24data API"""
+    if not isinstance(message_data, dict) or 't' not in message_data or 'd' not in message_data:
+        logger.debug(f"Invalid message format: {message_data}")
+        return
     
-    # If all URLs failed, wait before trying again
-    logger.warning("All WebSocket URLs failed, waiting 30 seconds before retry")
-    await asyncio.sleep(30)
+    event_type = message_data['t']
+    data = message_data['d']
+    
+    # Only process flight plan events
+    if event_type not in ['FLIGHT_PLAN', 'EVENT_FLIGHT_PLAN']:
+        return
+        
+    logger.debug(f"Processing {event_type} with data: {data}")
+    await process_flight_plan(data)
 
 async def process_flight_plan(flight_plan_data):
     """Process flight plan data and send notifications for matching callsigns"""
@@ -378,8 +382,6 @@ async def send_flight_plan_notification(flight_plan, matching_configs):
     if 'route' in flight_plan and flight_plan['route'] != 'N/A':
         embed.add_field(name="Route", value=flight_plan['route'], inline=False)
     
-    if 'realcallsign' in flight_plan and flight_plan['realcallsign'] != callsign:
-        embed.add_field(name="Real Callsign", value=flight_plan['realcallsign'], inline=True)
     
     embed.set_footer(text="ATC24 Flight Plan Monitor")
     
