@@ -14,8 +14,16 @@ This is a Discord bot that monitors flight plans from ATC24 (a flight simulation
 - ✅ Dependencies installed (discord.py, aiohttp, websockets, etc.)
 - ✅ SQLite database for storing server configurations
 - ✅ Slash commands for setup, configuration, and status
-- ⚠️  Requires Discord bot token configuration
-- ⚠️  Needs workflow setup for continuous operation
+- ✅ Workflow configured to run Discord bot automatically
+- ⚠️  Requires Discord bot token configuration (user needs to add DISCORD_BOT_TOKEN in secrets)
+
+## Setup Instructions for User
+1. **Add Discord Bot Token**: Go to Replit secrets and add `DISCORD_BOT_TOKEN` with your Discord bot token
+2. **Bot Permissions**: Ensure your Discord bot has the following permissions:
+   - Send Messages
+   - Embed Links
+   - Use Slash Commands
+3. **Start the Bot**: Once the token is added, the bot will start automatically via the configured workflow
 
 ## Project Architecture
 - **Language**: Python 3.11
@@ -47,3 +55,5 @@ This is a Discord bot that monitors flight plans from ATC24 (a flight simulation
 ## Recent Changes
 - 2025-09-19: Project imported from GitHub and configured for Replit environment
 - 2025-09-19: Dependencies installed using uv package manager
+- 2025-09-19: Workflow configured to run Discord bot automatically
+- 2025-09-19: Project fully set up and ready for use (pending Discord bot token configuration)
