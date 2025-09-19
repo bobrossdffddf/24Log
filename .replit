@@ -25,3 +25,6 @@ args = "python main.py"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[agent]
+expertMode = true
