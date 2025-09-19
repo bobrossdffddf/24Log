@@ -6,6 +6,7 @@ from typing import Dict, Set, Optional
 import discord
 from discord.ext import commands, tasks
 import aiohttp
+import websockets
 import logging
 
 # Set up logging
@@ -42,7 +43,8 @@ class FlightPlanBot(commands.Bot):
         # Store active configurations
         self.server_configs: Dict[int, Dict] = {}
         self.http_session: Optional[aiohttp.ClientSession] = None
-        self.previous_aircraft_states = {}
+        self.websocket_connection = None
+        self.processed_flight_plans = set()  # Track processed flight plans to avoid duplicates
         
     async def setup_hook(self):
         """Called when the bot is starting up"""
@@ -113,9 +115,9 @@ class FlightPlanBot(commands.Bot):
         """Called when bot is ready"""
         logger.info(f'{self.user} has logged in!')
         
-        # Start ATC 24 monitoring
-        if not atc24_monitor.is_running():
-            atc24_monitor.start()
+        # Start ATC 24 flight plan monitoring via WebSocket
+        if not flight_plan_monitor.is_running():
+            flight_plan_monitor.start()
 
 # Create bot instance
 bot = FlightPlanBot()
@@ -242,115 +244,93 @@ async def status_command(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed)
 
-@tasks.loop(seconds=3)  # Poll every 3 seconds as recommended by ATC24 API
-async def atc24_monitor():
-    """Monitor ATC 24 API for new aircraft (flight plans)"""
+@tasks.loop(reconnect=True)
+async def flight_plan_monitor():
+    """Monitor ATC 24 WebSocket for new flight plans"""
     if not bot.server_configs:
+        await asyncio.sleep(10)  # Wait if no configurations
         return
     
-    try:
-        if not bot.http_session:
-            logger.error("HTTP session not initialized")
-            return
-            
-        # Get data from both main server and event server
-        main_data = await fetch_aircraft_data(bot.http_session, 'https://24data.ptfs.app/acft-data')
-        event_data = await fetch_aircraft_data(bot.http_session, 'https://24data.ptfs.app/acft-data/event')
-        
-        if main_data:
-            await process_flight_data(main_data, 'Main Server')
-        if event_data:
-            await process_flight_data(event_data, 'Event Server')
-                
-    except Exception as e:
-        logger.error(f"Error monitoring ATC24: {e}")
-
-async def fetch_aircraft_data(session, url):
-    """Fetch aircraft data from ATC24 API with proper error handling and rate limiting"""
-    max_retries = 3
-    base_delay = 1
+    # ATC24 WebSocket endpoint - you may need to update this URL
+    websocket_urls = [
+        "wss://24data.ptfs.app/ws",
+        "wss://24data.ptfs.app/websocket", 
+        "wss://24data.ptfs.app/api/ws",
+        "wss://24data.ptfs.app/live"
+    ]
     
-    for attempt in range(max_retries):
+    for ws_url in websocket_urls:
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    # Validate response structure - ATC24 returns dict with callsigns as keys
-                    if isinstance(data, dict):
-                        # Convert dict to list format for easier processing
-                        aircraft_list = []
-                        for callsign, aircraft_data in data.items():
-                            aircraft_data['callsign'] = callsign
-                            aircraft_list.append(aircraft_data)
-                        return aircraft_list
-                    elif isinstance(data, list):
-                        return data
-                    else:
-                        logger.warning(f"Unexpected data format from {url}: {type(data)}")
-                        return None
-                elif response.status == 429:
-                    delay = base_delay * (2 ** attempt)
-                    logger.warning(f"ATC24 API rate limit hit - backing off for {delay}s (attempt {attempt + 1}/{max_retries})")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(delay)
-                        continue
-                    return None
-                else:
-                    logger.warning(f"Failed to fetch ATC24 data from {url}: HTTP {response.status}")
-                    return None
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout fetching data from {url} (attempt {attempt + 1}/{max_retries})")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(base_delay * (attempt + 1))
-                continue
-            return None
+            logger.info(f"Attempting to connect to WebSocket: {ws_url}")
+            async with websockets.connect(ws_url, ping_interval=30, ping_timeout=10) as websocket:
+                logger.info(f"Successfully connected to ATC24 WebSocket: {ws_url}")
+                bot.websocket_connection = websocket
+                
+                async for message in websocket:
+                    try:
+                        data = json.loads(message)
+                        await process_flight_plan(data)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Received invalid JSON from WebSocket: {message[:100]}...")
+                    except Exception as e:
+                        logger.error(f"Error processing WebSocket message: {e}")
+                        
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning(f"WebSocket connection closed: {ws_url}")
+            await asyncio.sleep(5)  # Wait before reconnecting
+            break
+        except websockets.exceptions.InvalidURI:
+            logger.warning(f"Invalid WebSocket URI: {ws_url}")
+            continue  # Try next URL
         except Exception as e:
-            logger.error(f"Error fetching data from {url}: {e} (attempt {attempt + 1}/{max_retries})")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(base_delay * (attempt + 1))
-                continue
-            return None
+            logger.error(f"WebSocket connection error for {ws_url}: {e}")
+            await asyncio.sleep(5)
+            continue  # Try next URL
     
-    return None
+    # If all URLs failed, wait before trying again
+    logger.warning("All WebSocket URLs failed, waiting 30 seconds before retry")
+    await asyncio.sleep(30)
 
-async def process_flight_data(aircraft_list, server_name):
-    """Process aircraft data and send notifications for new matching callsigns"""
-    if not isinstance(aircraft_list, list):
-        logger.warning(f"Expected list from ATC24 API, got {type(aircraft_list)}")
+async def process_flight_plan(flight_plan_data):
+    """Process flight plan data and send notifications for matching callsigns"""
+    # Handle both single flight plan and array of flight plans
+    flight_plans = []
+    if isinstance(flight_plan_data, list):
+        flight_plans = flight_plan_data
+    elif isinstance(flight_plan_data, dict):
+        # Check if it's a single flight plan
+        if 'callsign' in flight_plan_data:
+            flight_plans = [flight_plan_data]
+        else:
+            # Might be a wrapper object, check common wrapper keys
+            for key in ['flightPlan', 'data', 'flight_plan']:
+                if key in flight_plan_data:
+                    data = flight_plan_data[key]
+                    if isinstance(data, list):
+                        flight_plans = data
+                    elif isinstance(data, dict) and 'callsign' in data:
+                        flight_plans = [data]
+                    break
+    
+    if not flight_plans:
+        logger.debug(f"No flight plans found in data: {flight_plan_data}")
         return
     
-    current_aircraft = set()
-    
-    # Extract current aircraft callsigns with validation
-    for aircraft in aircraft_list:
-        if isinstance(aircraft, dict):
-            # Handle different possible field names for callsign
-            callsign = aircraft.get('callsign') or aircraft.get('call_sign') or aircraft.get('flight_id')
-            if callsign and isinstance(callsign, str) and callsign.strip():
-                current_aircraft.add(callsign.strip())
-    
-    # Check for new aircraft against previous state
-    server_key = server_name.lower().replace(" ", "_")
-    previous_aircraft = bot.previous_aircraft_states.get(server_key, set())
-    new_aircraft = current_aircraft - previous_aircraft
-    
-    # Store current state for next comparison
-    bot.previous_aircraft_states[server_key] = current_aircraft
-    
-    if not new_aircraft:
-        return
-    
-    logger.info(f"Detected {len(new_aircraft)} new aircraft in {server_name}: {', '.join(new_aircraft)}")
-    
-    # Check each new aircraft against server configurations
-    for aircraft in aircraft_list:
-        if not isinstance(aircraft, dict) or 'callsign' not in aircraft:
+    # Process each flight plan
+    for flight_plan in flight_plans:
+        if not isinstance(flight_plan, dict) or 'callsign' not in flight_plan:
             continue
             
-        callsign = aircraft['callsign']
-        if callsign not in new_aircraft:
-            continue
+        callsign = flight_plan['callsign']
+        
+        # Create unique identifier for this flight plan to avoid duplicates
+        flight_plan_id = f"{callsign}_{flight_plan.get('robloxName', '')}_{flight_plan.get('departing', '')}_{flight_plan.get('arriving', '')}"
+        
+        if flight_plan_id in bot.processed_flight_plans:
+            continue  # Already processed this flight plan
             
+        bot.processed_flight_plans.add(flight_plan_id)
+        
         # Find matching servers and prefixes
         matching_configs = []
         for guild_id, config in bot.server_configs.items():
@@ -360,45 +340,48 @@ async def process_flight_data(aircraft_list, server_name):
                     break
         
         if matching_configs:
-            await send_flight_plan_notification(aircraft, server_name, matching_configs)
+            logger.info(f"New flight plan filed: {callsign} by {flight_plan.get('robloxName', 'Unknown')}")
+            await send_flight_plan_notification(flight_plan, matching_configs)
 
-async def send_flight_plan_notification(aircraft, server_name, matching_configs):
+async def send_flight_plan_notification(flight_plan, matching_configs):
     """Send flight plan notification to Discord channels"""
-    callsign = aircraft.get('callsign', 'Unknown')
+    callsign = flight_plan.get('callsign', 'Unknown')
     
     # Create embed for flight plan notification
     embed = discord.Embed(
-        title="✈️ New Aircraft Detected",
+        title="✈️ New Flight Plan Filed",
         color=0x00ff00,
         timestamp=discord.utils.utcnow()
     )
     
-    embed.description = f"Aircraft **{callsign}** has spawned and is now online"
+    embed.description = f"Flight **{callsign}** has filed a flight plan"
     
     embed.add_field(name="Callsign", value=f"**{callsign}**", inline=True)
-    embed.add_field(name="Server", value=server_name, inline=True)
+    embed.add_field(name="Pilot", value=flight_plan.get('robloxName', 'Unknown'), inline=True)
     
-    # Add additional aircraft information if available (using ATC24 API field names)
-    if 'aircraftType' in aircraft:
-        embed.add_field(name="Aircraft", value=aircraft['aircraftType'], inline=True)
+    # Add flight plan details
+    if 'aircraft' in flight_plan:
+        embed.add_field(name="Aircraft", value=flight_plan['aircraft'], inline=True)
     
-    if 'playerName' in aircraft:
-        embed.add_field(name="Pilot", value=aircraft['playerName'], inline=True)
+    if 'departing' in flight_plan:
+        embed.add_field(name="Departure", value=flight_plan['departing'], inline=True)
     
-    if 'altitude' in aircraft:
-        embed.add_field(name="Altitude", value=f"{aircraft['altitude']} ft", inline=True)
+    if 'arriving' in flight_plan:
+        embed.add_field(name="Arrival", value=flight_plan['arriving'], inline=True)
     
-    if 'speed' in aircraft:
-        embed.add_field(name="Speed", value=f"{aircraft['speed']} kts", inline=True)
+    if 'flightlevel' in flight_plan:
+        embed.add_field(name="Flight Level", value=f"FL{flight_plan['flightlevel']}", inline=True)
     
-    if 'groundSpeed' in aircraft:
-        embed.add_field(name="Ground Speed", value=f"{aircraft['groundSpeed']:.0f} kts", inline=True)
+    if 'flightrules' in flight_plan:
+        embed.add_field(name="Flight Rules", value=flight_plan['flightrules'], inline=True)
     
-    if 'isOnGround' in aircraft:
-        status = "On Ground" if aircraft['isOnGround'] else "In Flight"
-        embed.add_field(name="Status", value=status, inline=True)
+    if 'route' in flight_plan and flight_plan['route'] != 'N/A':
+        embed.add_field(name="Route", value=flight_plan['route'], inline=False)
     
-    embed.set_footer(text=f"ATC24 Aircraft Monitor • {server_name}")
+    if 'realcallsign' in flight_plan and flight_plan['realcallsign'] != callsign:
+        embed.add_field(name="Real Callsign", value=flight_plan['realcallsign'], inline=True)
+    
+    embed.set_footer(text="ATC24 Flight Plan Monitor")
     
     # Send to all matching channels
     for guild_id, config, matched_prefix in matching_configs:
@@ -409,7 +392,7 @@ async def send_flight_plan_notification(aircraft, server_name, matching_configs)
                 permissions = channel.permissions_for(channel.guild.me)
                 if permissions.send_messages and permissions.embed_links:
                     await channel.send(embed=embed)
-                    logger.info(f"Sent aircraft notification for {callsign} (prefix: {matched_prefix}) to guild {guild_id}")
+                    logger.info(f"Sent flight plan notification for {callsign} (prefix: {matched_prefix}) to guild {guild_id}")
                 else:
                     logger.warning(f"Missing permissions to send embeds in channel {config['channel_id']} for guild {guild_id}")
             else:

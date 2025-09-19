@@ -8,4 +8,5 @@ dependencies = [
     "asyncio-mqtt>=0.16.2",
     "discord-py>=2.6.3",
     "websocket-client>=1.8.0",
+    "websockets>=15.0.1",
 ]
