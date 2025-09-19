@@ -35,7 +35,8 @@ def init_database():
 class FlightPlanBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True
+        # Remove privileged intents requirement since we don't need them
+        # intents.message_content = True  # Not needed for slash commands
         super().__init__(command_prefix='!', intents=intents)
         
         # Store active configurations
@@ -274,11 +275,19 @@ async def fetch_aircraft_data(session, url):
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     data = await response.json()
-                    # Validate response structure
-                    if not isinstance(data, list):
-                        logger.warning(f"Expected list from {url}, got {type(data)}")
+                    # Validate response structure - ATC24 returns dict with callsigns as keys
+                    if isinstance(data, dict):
+                        # Convert dict to list format for easier processing
+                        aircraft_list = []
+                        for callsign, aircraft_data in data.items():
+                            aircraft_data['callsign'] = callsign
+                            aircraft_list.append(aircraft_data)
+                        return aircraft_list
+                    elif isinstance(data, list):
+                        return data
+                    else:
+                        logger.warning(f"Unexpected data format from {url}: {type(data)}")
                         return None
-                    return data
                 elif response.status == 429:
                     delay = base_delay * (2 ** attempt)
                     logger.warning(f"ATC24 API rate limit hit - backing off for {delay}s (attempt {attempt + 1}/{max_retries})")
@@ -369,21 +378,25 @@ async def send_flight_plan_notification(aircraft, server_name, matching_configs)
     embed.add_field(name="Callsign", value=f"**{callsign}**", inline=True)
     embed.add_field(name="Server", value=server_name, inline=True)
     
-    # Add additional aircraft information if available
-    if 'aircraft_type' in aircraft:
-        embed.add_field(name="Aircraft", value=aircraft['aircraft_type'], inline=True)
+    # Add additional aircraft information if available (using ATC24 API field names)
+    if 'aircraftType' in aircraft:
+        embed.add_field(name="Aircraft", value=aircraft['aircraftType'], inline=True)
     
-    if 'departure' in aircraft:
-        embed.add_field(name="Departure", value=aircraft['departure'], inline=True)
-    
-    if 'arrival' in aircraft:
-        embed.add_field(name="Arrival", value=aircraft['arrival'], inline=True)
+    if 'playerName' in aircraft:
+        embed.add_field(name="Pilot", value=aircraft['playerName'], inline=True)
     
     if 'altitude' in aircraft:
         embed.add_field(name="Altitude", value=f"{aircraft['altitude']} ft", inline=True)
     
-    if 'squawk' in aircraft:
-        embed.add_field(name="Squawk", value=aircraft['squawk'], inline=True)
+    if 'speed' in aircraft:
+        embed.add_field(name="Speed", value=f"{aircraft['speed']} kts", inline=True)
+    
+    if 'groundSpeed' in aircraft:
+        embed.add_field(name="Ground Speed", value=f"{aircraft['groundSpeed']:.0f} kts", inline=True)
+    
+    if 'isOnGround' in aircraft:
+        status = "On Ground" if aircraft['isOnGround'] else "In Flight"
+        embed.add_field(name="Status", value=status, inline=True)
     
     embed.set_footer(text=f"ATC24 Aircraft Monitor • {server_name}")
     
@@ -413,5 +426,12 @@ if __name__ == "__main__":
         logger.error("DISCORD_BOT_TOKEN environment variable not set!")
         exit(1)
     
-    # Run the bot
-    bot.run(token)
+    # Add some debug logging
+    logger.info("Starting Discord bot...")
+    
+    try:
+        # Run the bot
+        bot.run(token, log_level=logging.INFO)
+    except Exception as e:
+        logger.error("Failed to start bot: %s", e)
+        raise
